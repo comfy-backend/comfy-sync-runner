@@ -1,0 +1,173 @@
+name: scheduled-sync
+
+# Hourly headless pricing data refresh for the PRIVATE repo
+# beulahkemp/comfyui_backend (wave-13 adhoc-1 — see RUNBOOK §Org runner
+# in that repo). This PUBLIC repo is compute-only: unlimited Actions
+# minutes; all code + data live in the private repo, checked out via
+# the GH_PAT secret; nothing sensitive is ever committed here.
+#
+# Pipeline: checkout private → npm ci + prisma db push →
+# npx tsx scripts/run-scheduled-sync.ts (seed → history replay →
+# web3 listings → channels + persist; JSON guards; exit codes) →
+# race-safe commit of the two data files ([skip ci]) → daily
+# state/last-run.json keep-alive commit (resets GHA's 60-day
+# schedule-inactivity timer + public observability).
+#
+# Secrets: GH_PAT (private checkout + push). Channel credentials come
+# from the private repo's committed .env (loaded by the script itself).
+# Never `echo` any secret; GitHub auto-redacts registered values.
+
+on:
+  schedule:
+    # Hourly at :07 — off the top of the hour (GitHub's :00 cron load
+    # makes delays worse there; repo convention).
+    - cron: '7 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run the sync but skip the data/state commits'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+permissions: {}
+# No pull_request trigger — fork PRs can never access secrets.
+
+concurrency:
+  group: scheduled-sync
+  cancel-in-progress: false # never kill a mid-flight sync
+
+jobs:
+  sync:
+    name: Pricing data refresh
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check configuration
+        env:
+          HAS_PAT: ${{ secrets.GH_PAT != '' }}
+        run: |
+          if [ "$HAS_PAT" != "true" ]; then
+            echo "::error::GH_PAT secret not configured on this repo."
+            exit 1
+          fi
+
+      - name: Check out private backend repo
+        uses: actions/checkout@v4
+        with:
+          repository: beulahkemp/comfyui_backend
+          token: ${{ secrets.GH_PAT }}
+          path: backend
+          # Full history: the race-safe push rebases the data commit.
+          fetch-depth: 0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/mvp-app/package-lock.json
+
+      - name: Install deps + prepare ephemeral DB
+        working-directory: backend/mvp-app
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          # db push creates the SQLite file + generates the Prisma client
+          # (DATABASE_URL comes from the checked-out .env; the file is
+          # ephemeral — git is the disk).
+          npx prisma db push
+
+      - name: Run scheduled sync (seed → replay → listings → channels)
+        working-directory: backend/mvp-app
+        env:
+          DATABASE_URL: file:./db/custom.db
+        run: |
+          set -euo pipefail
+          npx tsx scripts/run-scheduled-sync.ts
+
+      - name: Commit data refresh (race-safe, [skip ci])
+        if: ${{ inputs.dry_run != 'true' }}
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          git config user.name "beulahkemp"
+          git config user.email "223220792+beulahkemp@users.noreply.github.com"
+          git add mvp-app/src/data/model-catalog.json
+          git add mvp-app/src/data/price-history.jsonl
+          if git diff --cached --quiet; then
+            echo "No data changes this run — nothing to commit."
+            exit 0
+          fi
+          git commit -m "data(pricing): scheduled sync $(date -u +%Y-%m-%dT%H:%M:%SZ) [skip ci]"
+          # Race-safe push: a parallel session may have pushed to main
+          # mid-run. Rebase the data-only commit on top and retry. NEVER
+          # force-push; a failed push leaves the run red and the next
+          # hourly run re-syncs (git objects hold the data).
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "Data commit pushed (attempt $attempt)."
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt) — rebasing on origin/main and retrying."
+            git fetch origin main
+            git rebase origin/main
+            sleep $((attempt * 5))
+          done
+          echo "::error::data push failed after 3 attempts — a parallel session likely pushed; next hourly run re-syncs."
+          exit 1
+
+      - name: Keep runner repo schedulable (daily state commit)
+        if: ${{ inputs.dry_run != 'true' }}
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          RUNNER_REPO: comfy-backend/comfy-sync-runner
+        run: |
+          set -euo pipefail
+          today="$(date -u +%F)"
+          export TODAY="$today"
+          python3 - << 'PYEOF'
+          import base64
+          import json
+          import os
+          import urllib.request
+
+          pat = os.environ["GH_PAT"]
+          repo = os.environ["RUNNER_REPO"]
+          today = os.environ["TODAY"]
+          api = f"https://api.github.com/repos/{repo}/contents/state/last-run.json"
+
+          req = urllib.request.Request(api, headers={"Authorization": f"token {pat}",
+                                                    "User-Agent": "sync-runner"})
+          sha = ""
+          existing_date = ""
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  d = json.loads(resp.read().decode())
+              sha = d.get("sha", "")
+              content = base64.b64decode(d.get("content", "")).decode()
+              existing_date = json.loads(content).get("date", "")
+          except Exception:
+              pass  # 404 on first run — create mode
+
+          if existing_date == today:
+              print(f"state/last-run.json already records {today} — skipping.")
+              raise SystemExit(0)
+
+          payload = {
+              "date": today,
+              "purpose": "keeps GHA schedules alive (60-day inactivity rule) + public observability",
+          }
+          body = {"message": f"state: sync ran on {today}",
+                  "content": base64.b64encode(json.dumps(payload, indent=2).encode()).decode()}
+          if sha:
+              body["sha"] = sha
+          req = urllib.request.Request(api, data=json.dumps(body).encode(), method="PUT",
+                                      headers={"Authorization": f"token {pat}",
+                                               "Content-Type": "application/json",
+                                               "User-Agent": "sync-runner"})
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              code = resp.status
+          print(f"state/last-run.json committed for {today} (HTTP {code}).")
+          PYEOF
