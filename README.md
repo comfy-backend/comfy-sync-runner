@@ -13,7 +13,7 @@ the source account's Actions became billing-blocked.)
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `sync.yml` | hourly (:07) / dispatch | The pricing data refresh: checks out the **private** repo via the `GH_PAT` secret, runs the headless sync (`seed → price-history replay → web3 listings → pricing channels`), then race-safely commits the two data files (`model-catalog.json` + `price-history.jsonl`) back to the private repo with `[skip ci]`. Keeps `state/last-run.json` fresh (≤1 commit/day — resets GHA's 60-day schedule-inactivity timer). |
+| `sync.yml` | hourly, guaranteed (self-chain + :07/:47 cron backstops) / dispatch | The pricing data refresh: checks out the **private** repo via the `GH_PAT` secret, runs the headless sync (`seed → price-history replay → web3 listings → pricing channels`), then race-safely commits the two data files (`model-catalog.json` + `price-history.jsonl`) back to the private repo with `[skip ci]`. Keeps `state/last-run.json` fresh (≤1 commit/day — resets GHA's 60-day schedule-inactivity timer). |
 | `kill-dog.yml` | every 10 min / dispatch | Cloud-side GPU pod kill watchdog (L2): if the kill-dog gist heartbeat is stale (the owning dev server is gone) or a pod breached its TTL, terminate the RunPod pod. Logic lives in the private repo (`scripts/kill_dog.py`) so L1 (local daemon) and L2 share ONE implementation. |
 | `smoke.yml` | push / dispatch | Connectivity self-test: secrets present, private checkout, gist roundtrip, RunPod auth ping. |
 
@@ -46,6 +46,22 @@ the source account's Actions became billing-blocked.)
   expired. A rejected push means a parallel session pushed to the
   private repo's main mid-run — the run fails loudly by design and the
   next hourly run re-syncs.
+
+## Cadence guarantee (wave-14 B0.1 densifier)
+
+GitHub's scheduler DROPS ~2 of 3 scheduled runs under platform load
+(observed 2026-09-06: 4 runs across 10 hourly slots). `sync.yml` therefore
+guarantees hourly coverage two ways: (1) **self-chain** — every successful
+run sleeps until the next :07 boundary and dispatches its successor
+(workflow_dispatch runs are never dropped; the chain breaks only on
+failure, visible as a red run); (2) **cron backstops** at :07 and :47
+(~40% catch each per slot → expected broken-chain recovery ≤1h). The
+concurrency group serializes everything; a chain run occupies its runner
+for up to ~55 idle minutes (free on public repos, 1 concurrency slot).
+Disable the chain by setting the repo variable `SYNC_SELF_CHAIN=off`
+(crons still run). Acceptance (tracked in the private repo's BE PLAN
+B0.1): no wall-clock 2h window without a completed sync run over 48h;
+≥20 runs/24h.
 - **kill-dog failures** — check the gist (id in secrets) comments for
   recent kill records and `state.json` for the heartbeat; a failing
   sweep retries in 10 minutes.

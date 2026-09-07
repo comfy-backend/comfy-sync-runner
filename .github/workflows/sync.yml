@@ -16,12 +16,28 @@ name: scheduled-sync
 # Secrets: GH_PAT (private checkout + push). Channel credentials come
 # from the private repo's committed .env (loaded by the script itself).
 # Never `echo` any secret; GitHub auto-redacts registered values.
+#
+# ─── Cadence design (wave-14 B0.1 densifier) ──────────────────
+# GitHub's scheduler DROPS ~2 of 3 scheduled runs under platform load
+# (observed 2026-09-06: 4 runs across 10 hourly slots). Two mechanisms
+# guarantee hourly coverage:
+#   1. Self-chain (primary): on SUCCESS this workflow sleeps until the
+#      next :07 boundary and dispatches its own successor via
+#      workflow_dispatch (dispatch runs are never dropped). The chain
+#      breaks only on failure — visible as a red run.
+#   2. Cron backstops (secondary): TWO hourly slots (:07 and :47) catch
+#      a broken chain with ~40% each per slot → expected recovery ≤1h.
+# The concurrency group serializes everything; the chain only ever
+# queues ONE successor (no backlog growth). Reversible: set runner-repo
+# variable SYNC_SELF_CHAIN=off to disable the chain (crons still run).
 
 on:
   schedule:
-    # Hourly at :07 — off the top of the hour (GitHub's :00 cron load
-    # makes delays worse there; repo convention).
+    # Backstop slots — off the top of the hour (GitHub's :00 cron load
+    # makes delays/drops worse there; repo convention). :07 mirrors the
+    # chain target; :47 halves the broken-chain recovery gap.
     - cron: '7 * * * *'
+    - cron: '47 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -42,7 +58,7 @@ jobs:
   sync:
     name: Pricing data refresh
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 70  # sync (~8min) + self-chain sleep (≤55min) + margin
     steps:
       - name: Check configuration
         env:
@@ -170,4 +186,51 @@ jobs:
           with urllib.request.urlopen(req, timeout=30) as resp:
               code = resp.status
           print(f"state/last-run.json committed for {today} (HTTP {code}).")
+          PYEOF
+
+      - name: "Self-chain (schedule the next hourly run)"
+        # B0.1 densifier (see header). Only chains on SUCCESS — a failed
+        # sync must not propagate the loop (the red run is the alert; the
+        # :07/:47 cron backstops catch up). Disabled via runner-repo
+        # variable SYNC_SELF_CHAIN=off.
+        if: ${{ success() && inputs.dry_run != 'true' && vars.SYNC_SELF_CHAIN != 'off' }}
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          RUNNER_REPO: comfy-backend/comfy-sync-runner
+        run: |
+          set -euo pipefail
+          python3 - << 'PYEOF'
+          import datetime
+          import json
+          import os
+          import time
+          import urllib.request
+
+          repo = os.environ["RUNNER_REPO"]
+          pat = os.environ["GH_PAT"]
+
+          now = datetime.datetime.now(datetime.timezone.utc)
+          target = now.replace(minute=7, second=0, microsecond=0)
+          if target <= now:
+              target += datetime.timedelta(hours=1)
+          sleep_s = int((target - now).total_seconds())
+          if sleep_s > 3300:  # cap 55 min; never approach the 70-min timeout
+              sleep_s = 3300
+          print(f"::notice::self-chain sleeping {sleep_s}s until {target.isoformat()}Z, then dispatching the successor run.")
+          time.sleep(sleep_s)
+
+          api = f"https://api.github.com/repos/{repo}/actions/workflows/sync.yml/dispatches"
+          req = urllib.request.Request(
+              api,
+              data=json.dumps({"ref": "main"}).encode(),
+              method="POST",
+              headers={
+                  "Authorization": f"token {pat}",
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json",
+                  "User-Agent": "sync-runner",
+              },
+          )
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              print(f"Successor dispatched (HTTP {resp.status}). Chain continues.")
           PYEOF
