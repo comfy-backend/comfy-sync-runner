@@ -241,3 +241,75 @@ jobs:
           with urllib.request.urlopen(req, timeout=30) as resp:
               print(f"Successor dispatched (HTTP {resp.status}). Chain continues.")
           PYEOF
+
+      - name: "Alert on failure (gist comment, 6h-deduped)"
+        # Wave-17 audit E-02: a red run was previously its own only signal —
+        # nobody is paged. Persistent red = the data plane is down; if the
+        # kill-dog is ALSO red, orphaned pods bill unbounded while silent.
+        # Posts an audit COMMENT to the shared ops gist (never rewrites the
+        # kill-dog state file — comments are the append-only channel).
+        # Deduped: at most one [alert:sync] comment per 6h. Best-effort:
+        # alert failures never fail the run further.
+        if: ${{ failure() }}
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GIST_ID: ${{ secrets.KILLDOG_GIST_ID }}
+          ALERT_MARKER: "[alert:sync]"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 - << 'ALERTEOF'
+          import datetime
+          import json
+          import os
+          import sys
+          import urllib.request
+
+          pat = os.environ["GH_PAT"]
+          gist = os.environ["GIST_ID"]
+          marker = os.environ["ALERT_MARKER"]
+          run_url = os.environ["RUN_URL"]
+          DEDUPE_H = 6
+
+          def api(url, data=None):
+              req = urllib.request.Request(
+                  url,
+                  headers={"Authorization": f"token {pat}", "User-Agent": "sync-runner-alert"},
+                  data=json.dumps(data).encode() if data is not None else None,
+              )
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  return json.loads(r.read().decode() or "{}")
+
+          try:
+              comments = api(f"https://api.github.com/gists/{gist}/comments?per_page=10")
+          except Exception as e:
+              print(f"::warning::alert step could not read gist comments: {e}")
+              sys.exit(0)
+
+          for c in comments:
+              if marker in c.get("body", ""):
+                  created = datetime.datetime.strptime(
+                      c["created_at"], "%Y-%m-%dT%H:%M:%SZ"
+                  ).replace(tzinfo=datetime.timezone.utc)
+                  age_h = (datetime.datetime.now(datetime.timezone.utc) - created).total_seconds() / 3600
+                  if age_h < DEDUPE_H:
+                      print(f"alert deduped (last {marker} comment {age_h:.1f}h old < {DEDUPE_H}h)")
+                      sys.exit(0)
+                  break
+
+          try:
+              now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+              api(
+                  f"https://api.github.com/gists/{gist}/comments",
+                  {
+                      "body": (
+                          f"{marker} {now} RED RUN — sync pipeline failed. Logs: {run_url} "
+                          "(persistent red = data plane down; if [alert:kill-dog] is also recent, "
+                          "orphaned pods bill unbounded)"
+                      )
+                  },
+              )
+              print("alert comment posted")
+          except Exception as e:
+              print(f"::warning::alert comment post failed: {e}")
+          ALERTEOF
