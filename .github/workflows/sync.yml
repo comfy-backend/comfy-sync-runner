@@ -13,8 +13,10 @@ name: scheduled-sync
 # state/last-run.json keep-alive commit (resets GHA's 60-day
 # schedule-inactivity timer + public observability).
 #
-# Secrets: GH_PAT (private checkout + push). Channel credentials come
-# from the private repo's committed .env (loaded by the script itself).
+# Secrets: GH_PAT (private checkout + push), RUNPOD_API_KEY +
+# REPLICATE_API_TOKEN (injected as env below — wave-17 E-01: the backend's
+# tracked .env now carries placeholders only; channel credentials live
+# HERE as runner-repo secrets).
 # Never `echo` any secret; GitHub auto-redacts registered values.
 #
 # ─── Cadence design (wave-14 B0.1 densifier) ──────────────────
@@ -286,16 +288,22 @@ jobs:
               print(f"::warning::alert step could not read gist comments: {e}")
               sys.exit(0)
 
+          # Wave-17 verify round1: gist comments come OLDEST-FIRST — the
+          # previous first-match break aged the OLDEST alert (dedupe never
+          # fired). Scan ALL marker comments and dedupe on the NEWEST.
+          newest = None
           for c in comments:
               if marker in c.get("body", ""):
                   created = datetime.datetime.strptime(
                       c["created_at"], "%Y-%m-%dT%H:%M:%SZ"
                   ).replace(tzinfo=datetime.timezone.utc)
-                  age_h = (datetime.datetime.now(datetime.timezone.utc) - created).total_seconds() / 3600
-                  if age_h < DEDUPE_H:
-                      print(f"alert deduped (last {marker} comment {age_h:.1f}h old < {DEDUPE_H}h)")
-                      sys.exit(0)
-                  break
+                  if newest is None or created > newest:
+                      newest = created
+          if newest is not None:
+              age_h = (datetime.datetime.now(datetime.timezone.utc) - newest).total_seconds() / 3600
+              if age_h < DEDUPE_H:
+                  print(f"alert deduped (newest {marker} comment {age_h:.1f}h old < {DEDUPE_H}h)")
+                  sys.exit(0)
 
           try:
               now = datetime.datetime.now(datetime.timezone.utc).isoformat()

@@ -110,16 +110,22 @@ jobs:
               print(f"::warning::alert step could not read gist comments: {e}")
               sys.exit(0)
 
+          # Wave-17 verify round1: gist comments come OLDEST-FIRST — the
+          # previous first-match break aged the OLDEST alert (dedupe never
+          # fired). Scan ALL marker comments and dedupe on the NEWEST.
+          newest = None
           for c in comments:
               if marker in c.get("body", ""):
                   created = datetime.datetime.strptime(
                       c["created_at"], "%Y-%m-%dT%H:%M:%SZ"
                   ).replace(tzinfo=datetime.timezone.utc)
-                  age_h = (datetime.datetime.now(datetime.timezone.utc) - created).total_seconds() / 3600
-                  if age_h < DEDUPE_H:
-                      print(f"alert deduped (last {marker} comment {age_h:.1f}h old < {DEDUPE_H}h)")
-                      sys.exit(0)
-                  break
+                  if newest is None or created > newest:
+                      newest = created
+          if newest is not None:
+              age_h = (datetime.datetime.now(datetime.timezone.utc) - newest).total_seconds() / 3600
+              if age_h < DEDUPE_H:
+                  print(f"alert deduped (newest {marker} comment {age_h:.1f}h old < {DEDUPE_H}h)")
+                  sys.exit(0)
 
           try:
               now = datetime.datetime.now(datetime.timezone.utc).isoformat()
