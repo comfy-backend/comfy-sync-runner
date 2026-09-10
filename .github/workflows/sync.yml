@@ -99,6 +99,13 @@ jobs:
         working-directory: backend/mvp-app
         env:
           DATABASE_URL: file:./db/custom.db
+          # Wave-17 audit E-01: provider keys come from RUNNER SECRETS, not
+          # the tracked .env (run-scheduled-sync loads .env WITHOUT
+          # overriding existing env — explicit env wins; the tracked file
+          # now carries placeholders only). kill-dog.yml already used this
+          # pattern for its RunPod key.
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
         run: |
           set -euo pipefail
           npx tsx scripts/run-scheduled-sync.ts
