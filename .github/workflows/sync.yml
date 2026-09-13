@@ -240,8 +240,40 @@ jobs:
                   "User-Agent": "sync-runner",
               },
           )
-          with urllib.request.urlopen(req, timeout=30) as resp:
-              print(f"Successor dispatched (HTTP {resp.status}). Chain continues.")
+          # Wave-18: GitHub's dispatch API can 5xx transiently (observed
+          # run 383, 2026-09-13T09:03Z — a single HTTP 500 killed the
+          # chain; recovery fell to the ~2/3-dropped cron backstops).
+          # Retry up to 3 attempts with backoff; a final failure still
+          # goes red (alert) and the cron backstops remain the net.
+          import urllib.error
+          last_err = None
+          for attempt in range(1, 4):
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      print(f"Successor dispatched (HTTP {resp.status}, attempt {attempt}). Chain continues.")
+                  last_err = None
+                  break
+              except urllib.error.HTTPError as e:
+                  if 500 <= e.code < 600 and attempt < 3:
+                      wait = 10 * attempt
+                      print(f"::warning::dispatch attempt {attempt} got HTTP {e.code}; retrying in {wait}s.")
+                      time.sleep(wait)
+                      req = urllib.request.Request(
+                          api,
+                          data=json.dumps({"ref": "main"}).encode(),
+                          method="POST",
+                          headers={
+                              "Authorization": f"token {pat}",
+                              "Accept": "application/vnd.github+json",
+                              "Content-Type": "application/json",
+                              "User-Agent": "sync-runner",
+                          },
+                      )
+                      last_err = e
+                      continue
+                  raise
+          if last_err is not None:
+              raise last_err
           PYEOF
 
       - name: "Alert on failure (gist comment, 6h-deduped)"
