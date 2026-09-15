@@ -120,7 +120,18 @@ jobs:
           git config user.name "beulahkemp"
           git config user.email "223220792+beulahkemp@users.noreply.github.com"
           git add mvp-app/src/data/model-catalog.json
+          # F6 (wave-19): the history durable plane is the SHARD STORE
+          # (src/data/price-history/<YYYY-MM>.jsonl + manifest.json). The
+          # legacy single file line below still stages its DELETION if the
+          # migration/fold consumed it this cycle (git add on a removed
+          # path stages the removal); the guard keeps this workflow safe
+          # on pre-F6 checkouts where the shard dir does not exist yet.
           git add mvp-app/src/data/price-history.jsonl
+          if [ -d mvp-app/src/data/price-history ]; then
+            git add mvp-app/src/data/price-history/
+          else
+            echo "No shard dir (pre-F6 checkout) — skipping shard staging."
+          fi
           if git diff --cached --quiet; then
             echo "No data changes this run — nothing to commit."
             exit 0
